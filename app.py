@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import threading
+import time
+import urllib.request
 from typing import Any, Dict
 
 import pandas as pd
@@ -35,8 +38,10 @@ def create_app() -> Flask:
         return render_template("about_contact.html")
 
     @app.get("/health")
+    @app.get("/healthz")
     def health() -> Dict[str, Any]:
-        return {"ok": True}
+        """Health check endpoint for Render — must return 200 fast, no DB/model calls."""
+        return {"status": "healthy", "ok": True}
 
     @app.post("/predict")
     def predict() -> Any:
@@ -116,6 +121,42 @@ def create_app() -> Flask:
 
 
 app = create_app()
+
+
+def _keep_alive() -> None:
+    """
+    Daemon thread that self-pings /health every 10 minutes.
+    Prevents Render free-tier from sleeping the service after 15 min of inactivity.
+
+    - On Render:  reads RENDER_EXTERNAL_URL, waits 30 s, then pings every 10 min
+    - Local dev:  RENDER_EXTERNAL_URL not set → exits silently (no-op)
+    - Thread type: daemon → auto-killed when the main process exits
+    """
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not render_url:
+        return  # Not running on Render — skip silently
+
+    ping_url = f"{render_url}/health"
+    logger.info("[KeepAlive] Self-ping enabled → %s every 10 min", ping_url)
+
+    # Wait 30 s so Gunicorn fully starts before first ping
+    time.sleep(30)
+
+    while True:
+        try:
+            with urllib.request.urlopen(ping_url, timeout=10) as resp:
+                logger.info("[KeepAlive] Pinged → HTTP %s", resp.status)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[KeepAlive] Ping failed: %s", exc)
+        time.sleep(600)  # 10 minutes
+
+
+_keep_alive_thread = threading.Thread(
+    target=_keep_alive,
+    name="keep-alive",
+    daemon=True,  # dies automatically when the main process exits
+)
+_keep_alive_thread.start()
 
 def _is_port_free(host: str, port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
